@@ -1,0 +1,111 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CLIENT plugin. This is a completely different beast from the net9 server mods: it's a net472
+       BepInEx plugin that loads inside the EFT client, patched via SPT's Harmony wrapper. It does NOT
+       reference any SPTarkov.Server.* package - it references the GAME assemblies directly.
+       House-style note: the server C# rules do NOT all apply here. Client rules (from an SPT dev):
+         * NO LINQ in code that can run in-raid (GC hitches). Menu/stash code is fine, but prefer loops.
+         * NEVER use ?? / ?. on Unity GameObjects/Components - Unity's fake-null breaks them. Plain if. -->
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <RootNamespace>Leaves_GuildStash_Client</RootNamespace>
+    <AssemblyName>Leaves-GuildStash-Client</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <!-- Unity's overloaded == makes nullable-reference analysis actively misleading here. Off. -->
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OutputType>Library</OutputType>
+    <Version>0.1.0</Version>
+    <!-- Client plugin, NOT a server mod. dist\SPT mirrors the SERVER root (â€¦\SPT-4.0.13\SPT), so a
+         BepInEx path under it would be the wrong install. Build into a separate client dist tree, and
+         (below) auto-deploy to the actual EFT client's BepInEx\plugins (â€¦\SPT-4.0.13\BepInEx\plugins). -->
+    <OutputPath>..\..\dist\CLIENT\BepInEx\plugins\$(MSBuildProjectName)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- We reference game/BepInEx DLLs but must never copy them into the plugin output. -->
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- CRITICAL: opt out of the shared CopyToTestServer target. This DLL references BepInEx/IcyClawz,
+         which the net9 server can't resolve; if it lands in user\mods the server's DI type-scan crashes
+         on startup (FileNotFoundException on 'BepInEx'/'IcyClawz.CustomInteractions'). -->
+    <SkipTestServerCopy>true</SkipTestServerCopy>
+  </PropertyGroup>
+
+  <!-- Client-side equivalent of the shared CopyToTestServer target: deploy straight into the EFT
+       client's BepInEx\plugins so a build is immediately live. Mirrors the shared target's safety
+       (delete stale dll first; ContinueOnError so a locked/running-client DLL doesn't fail the build -
+       close EFT and rebuild to actually get the copy). No-ops if the client install isn't present. -->
+  <PropertyGroup>
+    <ClientPluginsPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\BepInEx\plugins</ClientPluginsPath>
+  </PropertyGroup>
+
+  <Target Name="CopyToClientPlugins" AfterTargets="Build" Condition="Exists('$(ClientPluginsPath)')">
+    <ItemGroup>
+      <ClientDeployFiles Include="$(OutputPath)**\*.*" />
+      <StaleClientDlls Include="$(ClientPluginsPath)\$(MSBuildProjectName)\*.dll" />
+    </ItemGroup>
+    <Delete Files="@(StaleClientDlls)" ContinueOnError="WarnAndContinue" />
+    <Copy
+      SourceFiles="@(ClientDeployFiles)"
+      DestinationFolder="$(ClientPluginsPath)\$(MSBuildProjectName)\%(RecursiveDir)"
+      SkipUnchangedFiles="true"
+      ContinueOnError="WarnAndContinue"
+    />
+  </Target>
+
+  <!-- All references are the on-disk client DLLs, Private=false so none get bundled. -->
+  <ItemGroup>
+    <Reference Include="BepInEx">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- SPT client libraries: RequestHandler (server round-trip) lives in spt-common; ModulePatch /
+         AbstractPatch (for when we start Harmony-patching the client) lives in spt-reflection. -->
+    <Reference Include="spt-common">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\BepInEx\plugins\spt\spt-common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="spt-reflection">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\BepInEx\plugins\spt\spt-reflection.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- The context-menu dependency. Its API: ICustomInteractionsProvider + CustomInteractionsManager. -->
+    <Reference Include="IcyClawz.CustomInteractions">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\BepInEx\plugins\IcyClawz.CustomInteractions.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- Bundled with the game; used to parse the /guildstash/boxtpls registry response. -->
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+
+    <!-- The game itself: Item (EFT.InventoryLogic), ItemUiContext / EItemViewType (EFT.UI), etc. -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Comfort">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\Comfort.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- No release-zip packaging here on purpose: Guild Stash ships as a SINGLE combined download
+       (this client + the server) built by the Leaves-GuildStash-Server project, which pulls this
+       plugin's build output straight from ..\dist\CLIENT and lays it into the same zip under
+       BepInEx\plugins. This project only builds itself and (above) deploys live to the client. -->
+</Project>
