@@ -9,7 +9,7 @@ using SPTarkov.Server.Core.Utils.Json.Converters;
 namespace Leaves_GuildStash_Server;
 
 // Server half of the Guild Stash mod.
-// OnLoad reads config and registers our custom item-event action bodies (the one wiring SPT can't do itself); everything else self-registers via [Injectable].
+// OnLoad reads config and registers what SPT's DI can't do itself: the custom item-event actions and the Harmony patches.
 [Injectable(TypePriority = OnLoadOrder.PostDBModLoader + 1)]
 public class GuildStashServer(ModHelper modHelper) : IOnLoad
 {
@@ -26,7 +26,7 @@ public class GuildStashServer(ModHelper modHelper) : IOnLoad
             return Task.CompletedTask;
         }
 
-        // Our custom item-event actions need explicit deserializers: BaseInteractionRequestData's converter throws on any Action it doesn't recognise.
+        // BaseInteractionRequestData's converter throws on an unrecognised Action, so register ours
         BaseInteractionRequestDataConverter.RegisterModDataHandler(
             GuildStashItemEventRouter.OpenAction,
             (string json) => JsonSerializer.Deserialize<GuildStashActionRequest>(json));
@@ -37,18 +37,18 @@ public class GuildStashServer(ModHelper modHelper) : IOnLoad
             GuildStashItemEventRouter.ConvertAction,
             (string json) => JsonSerializer.Deserialize<GuildStashActionRequest>(json));
 
-        // Close any open guild box when its owner deploys, so a raid never holds the storage lock.
-        // Harmony rather than a DI TypeOverride because LocationLifecycleService is a big-constructor Singleton and our cleanup is Scoped.
+        // close any open box when its owner deploys, so a raid never holds the storage lock.
+        // Harmony not a DI TypeOverride: LocationLifecycleService is a big-ctor Singleton, our cleanup is Scoped.
         new GuildStashRaidStartPatch().Enable();
 
-        // Refuse discarding an OPEN box, server-side: the item-template flags don't stop the client and nothing in SPT reads them.
+        // server-side discard/sell refusal for open boxes - the item-template flags don't stop the client and SPT ignores them
         new GuildStashDiscardPatch().Enable();
         new GuildStashSellPatch().Enable();
 
-        // Deliver a queued client reload (from a web-UI force-close) on the session's next item-event.
+        // deliver a queued client reload (from a web-UI force-close) on the session's next item-event
         new GuildStashResyncPatch().Enable();
 
-        // Alt-F4 / crash: close open boxes once the websocket has stayed gone past the grace period.
+        // alt-F4 / crash: close open boxes once the websocket has stayed gone past the grace period
         new GuildStashWebSocketClosePatch().Enable();
 
         Leaves.Utils.Instance.printColor("[GuildStash] Server up - /guildstash/ HTTP API + Open/Close/Convert item-event actions registered, raid-start auto-close patched in.", LogTextColor.Cyan);

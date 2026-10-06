@@ -11,17 +11,16 @@ using SPTarkov.Server.Core.Utils;
 
 namespace Leaves_GuildStash_Server;
 
-// The client sends { Action: "GuildStash...", ItemId: "<box item id>" } through the game's own inventory operation queue.
-// A concrete SUBCLASS of BaseInteractionRequestData on purpose: the base has a JsonConverter that switches on Action, so a subclass deserialises directly, bypassing it.
+// Client sends { Action: "GuildStash...", ItemId: "<box item id>" } through the game's inventory op-queue.
+// Concrete subclass on purpose: BaseInteractionRequestData's JsonConverter switches on Action; a subclass deserialises directly, past it.
 public record GuildStashActionRequest : BaseInteractionRequestData
 {
-    // The id of the box item the player right-clicked.
+    // the box item the player right-clicked
     public string? ItemId { get; set; }
 }
 
 // The real Open / Close / Convert actions.
-// Each mutates the caller's profile AND echoes the same delta into the response's profileChanges (NewItems / DeletedItems) so the client applies it live - same path a flea/trader purchase uses - with no relaunch.
-// Every action is a delete-old-box + spawn-fresh-box move (GuildStashBoxOps), the only shape the client op-queue accepts for a filled container.
+// Each mutates the profile AND sends the changes into profileChanges so the client applies it live, no relaunch.
 [Injectable]
 public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashCloser closer, HttpResponseUtil httpResponseUtil) : ItemEventRouterDefinition
 {
@@ -46,7 +45,7 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
         MongoId sessionID,
         ItemEventRouterResponse output)
     {
-        var request = body as GuildStashActionRequest;
+        GuildStashActionRequest? request = body as GuildStashActionRequest;
         string action = request?.Action ?? "";
         string itemId = request?.ItemId ?? "";
 
@@ -55,14 +54,14 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
             return Fail(output, action, "Guild Stash: the request had no item.");
         }
 
-        var (box, _) = GuildStashBoxOps.GatherSubtree(pmcData, itemId);
+        //Gather the box, and get checking if it exists for "free"
+        (Item? box, _) = GuildStashBoxOps.GatherSubtree(pmcData, itemId);
         if (box == null)
         {
             return Fail(output, action, "Guild Stash: that box isn't in your inventory.");
         }
 
-        // Authoritative gate (same checks the client preflights).
-        // Normally the client already refused a failing action, so this Warning backstop only fires on a race or a direct/unpatched client.
+        // authoritative gate (the client preflights the same checks); this only fires on a race or an unpatched client
         string? validationError = GuildStashValidation.ValidateAction(pmcData, box, action, storage);
         if (validationError != null)
         {
@@ -73,8 +72,7 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
         List<Item> created;
         string? error;
 
-        // Anything unexpected (a disk error writing storage, a malformed item tree) must NOT escape as an unhandled exception: SPT would return a 500, the client's operation queue would get no usable answer, and it can jam on that.
-        // Turning it into a Warning is strictly better - the player sees a reason, and AppendErrorToOutput forces a full client resync, which also repairs the desync if we happened to fail after the profile was already mutated.
+        // don't let an exception escape: SPT returns a 500, the op-queue gets no answer and can jam. a Warning gives a reason and forces a resync, which also repairs a desync if we failed mid-mutation
         try
         {
             if (action == OpenAction)
@@ -105,15 +103,13 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
             return Fail(output, action, error);
         }
 
-        // Mirror the delta into the response (lists pre-initialised by EventOutputHolder) so it applies live.
-        // Echo ONLY the top box as deleted - the client cascades removal of its children automatically.
-        // Listing the already-removed children explicitly wedges the op-queue (infinite spinner on close).
-        // `deleted` still holds the full set for the profile mutation / the debug count below.
-        var change = output.ProfileChanges[sessionID];
-        change.Items.DeletedItems.Add(new DeletedItem { Id = box.Id });
-        foreach (var item in created)
+        // echo ONLY the top box as deleted - the client cascades the children. listing them explicitly wedges the op-queue (infinite spinner on close).
+        // `deleted` still has the full set for the debug count below.
+        ProfileChange change = output.ProfileChanges[sessionID];
+        change.Items!.DeletedItems.Add(new DeletedItem { Id = box.Id });
+        foreach (Item item in created)
         {
-            change.Items.NewItems.Add(item);
+            change.Items!.NewItems.Add(item);
         }
 
         if (GuildStashContext.Config.Debug)
@@ -124,8 +120,8 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
         return new ValueTask<ItemEventRouterResponse>(output);
     }
 
-    // Surface a player-facing error: push it onto the response's Warnings (via SPT's helper) so the EFT client shows it as a red notification and applies NOTHING.
-    // We only ever call this BEFORE mutating the profile, so there's nothing to roll back. Also logs server-side for debugging.
+    // player-facing error: pushed onto Warnings, so the client shows a red notification and applies NOTHING.
+    // only ever called BEFORE mutating the profile - nothing to roll back.
     private ValueTask<ItemEventRouterResponse> Fail(ItemEventRouterResponse output, string action, string message)
     {
         Leaves.Utils.Instance.printColor($"[GuildStash] {action} rejected: {message}", LogTextColor.Red);
@@ -133,38 +129,35 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
         return new ValueTask<ItemEventRouterResponse>(output);
     }
 
-    // Open a CLOSED guild box: replace the closed case with an OPEN case full of the stored contents.
-    // Preconditions (closed guild box, stash root, registered id, not already open) were checked by ValidateAction; here we just derive the values and do the swap.
+    // Open a closed box: swap it for an open case full of the stored contents. Preconditions already checked by ValidateAction.
     private string? HandleOpen(PmcData pmc, Item box, MongoId sessionID, out List<string> deleted, out List<Item> created)
     {
         deleted = new List<string>();
         created = new List<Item>();
 
-        // Guaranteed by ValidateAction - guarded defensively rather than asserted.
-        if (!GuildStashContext.ClosedToOpenTpl.TryGetValue(box.Template, out var openTpl))
+        // guaranteed by ValidateAction; guarded, not asserted
+        if (!GuildStashContext.ClosedToOpenTpl.TryGetValue(box.Template, out MongoId openTpl))
         {
             return "Guild Stash: that isn't a closed guild box.";
         }
         string? id = GuildStashValidation.ParseRemoteTag(box, out _);
         if (id == null)
         {
-            return "Guild Stash: this box needs an '@remote <id>' tag.";
+            return "Guild Stash: this box needs an '@r <id>;' tag.";
         }
 
-        // Re-check "readable" here rather than trusting ValidateAction's load: this is the authoritative path, and an unreadable file otherwise reads back as an EMPTY stash - which the next close would then make permanent.
-        var stored = storage.Load(id, out bool unreadable);
+        // re-check readable here: an unreadable file reads back as an EMPTY stash, and the next close would make that permanent
+        StoredBox stored = storage.Load(id, out bool unreadable);
         if (unreadable)
         {
             return $"Guild Stash: storage '{id}' is corrupt and can't be opened - check the server log and storage/backups.";
         }
-        var contents = stored.Contents;
+        List<Item> contents = stored.Contents;
         string contentsRoot = stored.RootId.Length > 0 ? stored.RootId : box.Id.ToString();
 
-        // Rescue for a closed box that still physically holds items.
-        // Convert used to stuff the original case's contents INTO the closed box while registering an EMPTY storage file - and since an open deletes the closed box's whole subtree, those items were silently destroyed on the first open.
-        // Convert now writes them to storage instead, but a box converted before that fix still carries them, so fold them in here rather than dropping them.
-        // If BOTH the box and the file hold items we can't merge two content roots safely, so refuse loudly instead of destroying one of them.
-        var (_, strays) = GuildStashBoxOps.GatherSubtree(pmc, box.Id.ToString());
+        // rescue: a box converted before the fix still physically holds its items (Convert now writes them to storage). fold them in rather than drop them on open.
+        // if both the box AND the file hold items, we can't merge two roots safely - refuse loudly instead of destroying one.
+        (_, List<Item> strays) = GuildStashBoxOps.GatherSubtree(pmc, box.Id.ToString());
         if (strays.Count > 0)
         {
             if (contents.Count > 0)
@@ -176,26 +169,24 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
             contentsRoot = box.Id.ToString();
         }
 
-        // Claim the storage BEFORE mutating anything.
-        // THIS is the real open-lock: ValidateAction's IsOpenSomewhere check above is only a preflight, and two opens racing between that check and the bind both passed it, each spawning a box full of the same contents.
-        // The new box's id is minted here so the claim can name it before ReplaceBox spawns it.
-        var newBoxId = new MongoId();
+        // claim the storage BEFORE mutating anything - THIS is the real open-lock (ValidateAction's check is just a preflight two racing opens can both pass).
+        // mint the new box id here so the claim can name it before ReplaceBox spawns it.
+        MongoId newBoxId = new();
         if (!storage.TryClaimStorage(newBoxId.ToString(), id, sessionID.ToString(), out _))
         {
             return "Guild Stash: that storage is already open. Close it before opening it again.";
         }
 
-        // We deliberately DON'T re-save the file here - ReplaceBox mutates `contents` (re-ids/reparents them onto the new box), so saving would desync the file's rootId from its contents.
-        // The file keeps its last-closed snapshot until the next Close.
+        // don't re-save the file here: ReplaceBox re-ids `contents` onto the new box, so a save would desync rootId from contents. the file keeps its last-closed snapshot until Close.
         try
         {
-            var (del, cre) = GuildStashBoxOps.ReplaceBox(pmc, box, openTpl, newBoxId, contentsRoot, contents);
+            (List<string> del, List<Item> cre) = GuildStashBoxOps.ReplaceBox(pmc, box, openTpl, newBoxId, contentsRoot, contents);
             deleted = del;
             created = cre;
         }
         catch (Exception)
         {
-            // Never leave a claim behind for a box that was never spawned - that locks the storage for everyone with no open box left to close it.
+            // spawn failed - drop the claim, or the storage locks with no box to close it
             storage.UnbindOpenBox(newBoxId.ToString());
             throw;
         }
@@ -204,53 +195,50 @@ public class GuildStashItemEventRouter(GuildStashStorage storage, GuildStashClos
         return null;
     }
 
-    // Close an OPEN guild box: save its current contents to storage, replace it with an empty CLOSED case.
-    // The actual mutation lives in GuildStashCloser (shared with the offline logout / login-reconcile path); here we just delegate and let the caller mirror the delta into profileChanges for the live client.
+    // Close an open box. Mutation is in GuildStashCloser (shared with the offline paths); here we just delegate.
     private string? HandleClose(PmcData pmc, Item box, MongoId sessionID, out List<string> deleted, out List<Item> created)
     {
         return closer.CloseInProfile(pmc, box, sessionID, out deleted, out created);
     }
 
-    // Convert a plain Item/THICC case (tagged '@remote <ID>') into the CLOSED guild version, keeping its contents and its tag.
-    // The fresh-id check ran in ValidateAction; here we register + swap.
+    // Convert a tagged Item/THICC case into the closed guild version, keeping contents + tag. Fresh-id check already ran in ValidateAction.
     private string? HandleConvert(PmcData pmc, Item box, out List<string> deleted, out List<Item> created)
     {
         deleted = new List<string>();
         created = new List<Item>();
 
-        // Guaranteed by ValidateAction - guarded defensively rather than asserted.
-        if (!GuildStashContext.BaseToClosedTpl.TryGetValue(box.Template, out var closedTpl))
+        // guaranteed by ValidateAction; guarded, not asserted
+        if (!GuildStashContext.BaseToClosedTpl.TryGetValue(box.Template, out MongoId closedTpl))
         {
             return "Guild Stash: that case can't be made into a guild box.";
         }
         string? id = GuildStashValidation.ParseRemoteTag(box, out _);
         if (id == null)
         {
-            return "Guild Stash: tag the case '@remote <id>' first.";
+            return GuildStashValidation.ConvertNeedsTagMessage;
         }
 
-        // The case's current contents go straight into the STORAGE, NOT into the closed box.
-        // A CLOSED box is a sealed resting state (its grids are filtered to hold nothing) and an open replaces it wholesale, so anything left sitting inside it would simply be deleted the first time the stash was opened.
-        // Snapshot the contents BEFORE ReplaceBox re-ids them.
-        var (_, descendants) = GuildStashBoxOps.GatherSubtree(pmc, box.Id.ToString());
-        var stored = new StoredBox
+        // contents go straight into STORAGE, not the closed box: a closed box holds nothing and open replaces it wholesale, so anything inside would be deleted on first open.
+        // snapshot before ReplaceBox re-ids them.
+        (_, List<Item> descendants) = GuildStashBoxOps.GatherSubtree(pmc, box.Id.ToString());
+        StoredBox stored = new()
         {
             Id = id,
             RootId = box.Id.ToString(),
             Contents = descendants,
             Holder = null,
-            // Stamp the case type so Open can refuse a box of a different kind later.
+            // stamp the case type so Open can refuse a wrong-kind box later
             BoxKey = GuildStashContext.BoxKeyForTpl(closedTpl),
         };
 
-        // Register + fill the storage in ONE guarded step, so the id is claimed the moment the box is made (a later Convert to the same id is rejected even before this box is ever opened) and two players converting the same fresh id can't both pass the check.
+        // register + fill in one guarded step, so the id is claimed the instant the box exists and two converts of the same id can't both pass
         if (!storage.TryCreateStorage(stored))
         {
             return "Guild Stash: that ID is already in use. Pick a new one.";
         }
 
-        // Spawn an EMPTY closed case in its place; its Upd (incl. the @remote tag) rides along on the new box.
-        var (del, cre) = GuildStashBoxOps.ReplaceBox(pmc, box, closedTpl, new MongoId(), box.Id.ToString(), new List<Item>());
+        // spawn an empty closed case; its Upd (incl. the @r tag) rides along
+        (List<string> del, List<Item> cre) = GuildStashBoxOps.ReplaceBox(pmc, box, closedTpl, new MongoId(), box.Id.ToString(), new List<Item>());
         deleted = del;
         created = cre;
 

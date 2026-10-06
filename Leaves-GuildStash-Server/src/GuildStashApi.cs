@@ -8,6 +8,7 @@ using SPTarkov.Server.Core.Helpers;
 using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Eft.Common;
 using SPTarkov.Server.Core.Models.Eft.Common.Tables;
+using SPTarkov.Server.Core.Models.Eft.Profile;
 using SPTarkov.Server.Core.Models.Eft.Ws;
 using SPTarkov.Server.Core.Models.Logging;
 using SPTarkov.Server.Core.Servers;
@@ -16,65 +17,73 @@ using SPTarkov.Server.Core.Servers.Ws;
 
 namespace Leaves_GuildStash_Server;
 
-// Body of a POST /guildstash/precheck: which action, on which box item.
+// POST Body /guildstash/precheck
 public sealed class PrecheckRequest
 {
     [JsonPropertyName("action")]
     public string Action { get; set; } = "";
 
     [JsonPropertyName("itemId")]
-    public string ItemId { get; set; } = "";
+    public string ItemId { get; set; } = ""; // box item id
+
+    // The tag text the client currently sees on that box. Convert only, and only used to answer the
+    // preflight - the real Convert op re-reads our own copy. Null/absent = fall back to our copy.
+    [JsonPropertyName("tag")]
+    public string? Tag { get; set; }
 }
 
-// Body of a POST /guildstash/api/forceclose: which storage to force-release.
+// POST Body /guildstash/api/forceclose
 public sealed class ForceCloseRequest
 {
     [JsonPropertyName("id")]
-    public string Id { get; set; } = "";
+    public string Id { get; set; } = ""; // storage id
 }
 
-// The Guild Stash HTTP API. Self-registers by being [Injectable]; SPT routes any request we CanHandle here.
-// It serves: the box-template registry the client fetches on load; a preflight endpoint that runs the action validation WITHOUT mutating (so the client can show a soft notification instead of a resync-forcing Warning); and the web UI page + its storage feed / force-close.
-// The actual open/close/convert mutations go through the item-event pipeline (GuildStashItemEventRouter).
 [Injectable]
 public class GuildStashApi(
     ProfileHelper profileHelper,
     GuildStashStorage storage,
     GuildStashCloser closer,
-    SaveServer saveServer,
-    SptWebSocketConnectionHandler wsHandler,
-    ModHelper modHelper) : IHttpListener, IOnLoad
+    SptWebSocketConnectionHandler wsHandler) : IHttpListener, IOnLoad
 {
-    private const string Prefix = "/guildstash/";
-
-    // Publish our routes to the suite-wide Dev directory (served at /webui/dev/routes). Utils.Instance is set well before any OnLoad.
     public Task OnLoad()
     {
-        var routes = new List<Leaves.RouteInfo>
+        List<Leaves.RouteInfo> routes = new()
         {
-            new Leaves.RouteInfo("GET", "/guildstash/ui", "Guild Stash web UI (storage list + force-close).", "ui"),
+            // The /guildstash/ui page (guildstash.html) is served by the Leaves-WebUI mod now, which
+            // registers it under "Web UI (static files)". Left commented so the move is visible.
+            //   new Leaves.RouteInfo("GET", "/guildstash/ui", "Guild Stash web UI (storage list + force-close).", "ui"),
             new Leaves.RouteInfo("GET", "/guildstash/boxtpls", "Box-template registry { closed, open, baseTpls } the client fetches on load.", "api"),
-            new Leaves.RouteInfo("GET", "/guildstash/api/storages", "All storages with contents, open ones first (powers the UI list).", "api"),
-            new Leaves.RouteInfo("POST", "/guildstash/precheck", "Preflight an action { action, itemId } without mutating (soft-notification check).", "internal"),
-            new Leaves.RouteInfo("POST", "/guildstash/api/forceclose", "Force-close a storage { id }: properly closes the holder's open box (no duplication) and kicks them to the login screen if online.", "api", true),
+            new Leaves.RouteInfo("GET", "/guildstash/api/storages", "All storages with contents and item trees (powers the UI list).", "api"),
+            new Leaves.RouteInfo("POST", "/guildstash/precheck", "Preflight an action { action, itemId, tag? } without mutating (soft-notification check); `tag` is the client's live tag, Convert only.", "internal"),
+            new Leaves.RouteInfo("POST", "/guildstash/api/forceclose", "Force-close a storage { id }: closes the holder's open box for real (no dupe) and reloads their client if online.", "api", true),
         };
         Leaves.Utils.Instance.RegisterRoutes("Guild Stash", routes);
         return Task.CompletedTask;
     }
 
-    private readonly string uiDir = System.IO.Path.Combine(
-        modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly()),
-        "assets", "ui");
+    // guildstash.html moved to the Leaves-WebUI mod, which serves every Leaves mod's static UI files.
+    // This listener is the JSON API + the client precheck/forceclose surface only now.
+    //   private readonly string uiDir = System.IO.Path.Combine(
+    //       modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly()), "assets", "ui");
 
     private static readonly JsonSerializerOptions Json = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
+    private const string Prefix = "/guildstash/";
+
+    // /guildstash/ui (the page file) is served by the Leaves-WebUI mod now - excluded here so exactly
+    // one listener claims it (listener dispatch order is not guaranteed). Everything else under
+    // /guildstash/ - boxtpls, precheck, /api/* - is still ours.
     public bool CanHandle(MongoId sessionId, HttpContext context)
     {
-        // "/guildstash/" is ours alone, so this never shadows an SPT route.
-        return Leaves.HttpUtils.HasPrefix(context, Prefix);
+        if (!Leaves.HttpUtils.HasPrefix(context, Prefix))
+        {
+            return false;
+        }
+        return (context.Request.Path.Value ?? "").TrimEnd('/') != "/guildstash/ui";
     }
 
     public async Task Handle(MongoId sessionId, HttpContext context)
@@ -92,10 +101,8 @@ public class GuildStashApi(
             {
                 await HandlePrecheck(sessionId, context);
             }
-            else if (method == "GET" && Leaves.HttpUtils.IsGet(context, "/guildstash/ui"))
-            {
-                await Leaves.HttpUtils.ServeFile(context, System.IO.Path.Combine(uiDir, "guildstash.html"), "text/html; charset=utf-8");
-            }
+            // /guildstash/ui static serve moved to the Leaves-WebUI mod (guildstash.html);
+            // CanHandle already routes that path elsewhere.
             else if (method == "GET" && path.EndsWith("/api/storages", StringComparison.OrdinalIgnoreCase))
             {
                 await HandleStorages(context);
@@ -117,24 +124,22 @@ public class GuildStashApi(
     }
 
     // GET /guildstash/boxtpls -> { closed:[...], open:[...], baseTpls:[...] }.
-    // The client fetches this once on load so it knows which item templates are guild boxes (and thus which right-click action to show):
-    //   closed -> "Open Remote", open -> "Close Remote", base (plain Item/THICC case) -> "Convert to Remote".
     private async Task HandleBoxTpls(HttpContext context)
     {
-        var closed = new List<string>();
-        foreach (var tpl in GuildStashContext.ClosedToOpenTpl.Keys)
+        List<string> closed = new();
+        foreach (MongoId tpl in GuildStashContext.ClosedToOpenTpl.Keys)
         {
             closed.Add(tpl.ToString());
         }
 
-        var open = new List<string>();
-        foreach (var tpl in GuildStashContext.OpenToClosedTpl.Keys)
+        List<string> open = new();
+        foreach (MongoId tpl in GuildStashContext.OpenToClosedTpl.Keys)
         {
             open.Add(tpl.ToString());
         }
 
-        var baseTpls = new List<string>();
-        foreach (var tpl in GuildStashContext.BaseToClosedTpl.Keys)
+        List<string> baseTpls = new();
+        foreach (MongoId tpl in GuildStashContext.BaseToClosedTpl.Keys)
         {
             baseTpls.Add(tpl.ToString());
         }
@@ -148,215 +153,179 @@ public class GuildStashApi(
     }
 
     // POST /guildstash/precheck { action, itemId } -> { ok, message }.
-    // Runs the exact validation the item-event would, but mutates nothing - the client calls this first and, on !ok, shows a soft notification instead of firing the action.
-    // On any server-side hiccup we return ok:true so the client isn't blocked (the item-event's own Warning is still the authoritative backstop).
     private async Task HandlePrecheck(MongoId sessionId, HttpContext context)
     {
         string body = await Leaves.HttpUtils.ReadBody(context);
-        var request = JsonSerializer.Deserialize<PrecheckRequest>(body, Json);
+        PrecheckRequest? request = JsonSerializer.Deserialize<PrecheckRequest>(body, Json);
         if (request == null || request.ItemId.Length == 0 || request.Action.Length == 0)
         {
             await WriteJson(context, StatusCodes.Status200OK, new { ok = true, message = (string?)null });
             return;
         }
 
-        var pmc = profileHelper.GetPmcProfile(sessionId);
+        PmcData? pmc = profileHelper.GetPmcProfile(sessionId);
         if (pmc?.Inventory?.Items == null)
         {
             await WriteJson(context, StatusCodes.Status200OK, new { ok = true, message = (string?)null });
             return;
         }
 
-        Item? box = null;
-        foreach (var item in pmc.Inventory.Items)
-        {
-            if (item.Id.ToString() == request.ItemId)
-            {
-                box = item;
-                break;
-            }
-        }
+        Item? box = pmc.Inventory.Items.FirstOrDefault((Item item) => item.Id.ToString() == request.ItemId);
         if (box == null)
         {
             await WriteJson(context, StatusCodes.Status200OK, new { ok = false, message = "Guild Stash: that box isn't in your inventory." });
             return;
         }
 
-        string? error = GuildStashValidation.ValidateAction(pmc, box, request.Action, storage);
+        // TAG-RACE: our profile copy can lag the player's tag by one queued item-event op, and from here a
+        // missing tag and a malformed one look identical. So for Convert we judge the CLIENT's live tag
+        // text instead - parsed by our own ParseRemoteTag, so the rules are unchanged. Preflight only.
+        string? error = GuildStashValidation.ValidateAction(pmc, box, request.Action, storage, request.Tag);
         await WriteJson(context, StatusCodes.Status200OK, new { ok = error == null, message = error });
     }
 
-    // GET /guildstash/api/storages -> [{ id, open, holderId, holderNickname, openedUtc, boxType, totalItems, tree:[node...] }] where a node is { tpl, name, tag, count, children:[node...] }.
-    // Powers the web UI: the full nested item tree (containers expand to reveal their contents), each storage's case type, and a total that counts each ENTRY once (stack size ignored).
-    private async Task HandleStorages(HttpContext context)
+    // Wire shapes for the web UI storage feed.
+    public sealed class StorageDto
     {
-        var infos = storage.ListStorages();
-        var typeMap = MapStorageToBoxName();
-        var dtos = new List<StorageDto>();
-
-        // Open storages first, then the rest - two passes, no lambda (house style).
-        for (int pass = 0; pass < 2; pass++)
-        {
-            foreach (var info in infos)
-            {
-                bool wantOpen = pass == 0;
-                if (info.Open != wantOpen)
-                {
-                    continue;
-                }
-
-                var dto = new StorageDto
-                {
-                    Id = info.Id,
-                    Open = info.Open,
-                    HolderId = info.Holder,
-                    OpenedUtc = info.OpenedUtc,
-                    Unreadable = info.Unreadable,
-                };
-
-                // The storage's OWN recorded case type is authoritative when it has one. Only storages written before BoxKey existed need the profile-scan guess.
-                if (info.BoxKey.Length > 0)
-                {
-                    dto.BoxType = GuildStashContext.BoxNameForKey(info.BoxKey);
-                }
-                else if (typeMap.TryGetValue(info.Id.ToLowerInvariant(), out var boxType))
-                {
-                    dto.BoxType = boxType;
-                }
-
-                // Which flat item list + root to tree-ify. An OPEN box reads LIVE from the holder's profile (the file only holds the last-closed snapshot); a CLOSED box uses the file contents.
-                List<Item> flat = info.FileContents;
-                string rootId = info.RootId;
-                if (info.Open && info.OpenBoxItemId != null && info.Holder != null && info.Holder.Length == 24)
-                {
-                    var holderPmc = profileHelper.GetPmcProfile(new MongoId(info.Holder));
-                    dto.HolderNickname = holderPmc?.Info?.Nickname;
-                    if (holderPmc?.Inventory?.Items != null)
-                    {
-                        var (_, descendants) = GuildStashBoxOps.GatherSubtree(holderPmc, info.OpenBoxItemId);
-                        flat = descendants;
-                        rootId = info.OpenBoxItemId;
-                    }
-                }
-
-                int count = 0;
-                int units = 0;
-                dto.Tree = BuildTree(flat, rootId, ref count, ref units);
-                dto.TotalItems = count;
-                dto.TotalUnits = units;
-                dtos.Add(dto);
-            }
-        }
-
-        await WriteJson(context, StatusCodes.Status200OK, dtos);
+        [JsonPropertyName("id")] public string Id { get; set; } = "";
+        [JsonPropertyName("open")] public bool Open { get; set; }
+        [JsonPropertyName("holderId")] public string? HolderId { get; set; }
+        [JsonPropertyName("holderNickname")] public string? HolderNickname { get; set; }
+        [JsonPropertyName("openedUtc")] public string? OpenedUtc { get; set; }
+        [JsonPropertyName("boxType")] public string? BoxType { get; set; } // case type, e.g. "Item case" / "T H I C C item case"
+        [JsonPropertyName("unreadable")] public bool Unreadable { get; set; } // file exists but won't parse
+        [JsonPropertyName("totalItems")] public int TotalItems { get; set; } // item ENTRIES, stack size ignored
+        [JsonPropertyName("totalUnits")] public int TotalUnits { get; set; } // stack sizes SUMMED (a stack of 60 = 60)
+        [JsonPropertyName("tree")] public List<StorageNodeDto> Tree { get; set; } = new List<StorageNodeDto>(); // nested item tree
     }
 
-    // Build a nested display tree from a flat item list, rooted at the items whose ParentId == rootId. Each node carries its tpl, localised name, optional player Tag, and stack count.
-    //
-    // TWO totals, because they answer different questions: `total` counts ENTRIES (one per node, stack size ignored - "how many things are in here"), while `units` sums the stack sizes ("how many items in total", so a stack of 60 rounds counts 60). The UI shows both.
+    // One node in a box's item tree - an item plus whatever nests inside it (grid contents, mods).
+    public sealed class StorageNodeDto
+    {
+        [JsonPropertyName("tpl")] public string Tpl { get; set; } = "";
+        [JsonPropertyName("name")] public string Name { get; set; } = "";
+        [JsonPropertyName("tag")] public string? Tag { get; set; }
+        [JsonPropertyName("count")] public int Count { get; set; } // stack size; still one entry for the total-items count
+        [JsonPropertyName("children")] public List<StorageNodeDto> Children { get; set; } = new List<StorageNodeDto>();
+    }
+
+    // GET /guildstash/api/storages -> StorageDto
+    private async Task HandleStorages(HttpContext context)
+    {
+        List<GuildStashStorage.StorageInfo> allStorageInfos = storage.ListStorages();
+        List<StorageDto> allBoxes = new();
+
+        // Natural order - whatever ListStorages() yields. Presentation ordering (open first, etc.) is the web UI's job.
+        foreach (GuildStashStorage.StorageInfo storageInfo in allStorageInfos)
+        {
+            StorageDto box = new()
+            {
+                Id = storageInfo.Id,
+                Open = storageInfo.Open,
+                HolderId = storageInfo.Holder,
+                OpenedUtc = storageInfo.OpenedUtc,
+                Unreadable = storageInfo.Unreadable,
+            };
+
+            // BoxKey is the recorded case type; pre-BoxKey storages get no type
+            if (storageInfo.BoxKey.Length > 0)
+            {
+                box.BoxType = GuildStashContext.BoxNameForKey(storageInfo.BoxKey);
+            }
+
+            // OPEN box: tree from the holder's live profile (the file is only the last-closed snapshot). CLOSED box: from the file.
+            List<Item> flat = storageInfo.FileContents;
+            string rootId = storageInfo.RootId;
+            if (storageInfo.Open && storageInfo.OpenBoxItemId != null && storageInfo.Holder != null && storageInfo.Holder.Length == 24)
+            {
+                PmcData? holderPmc = profileHelper.GetPmcProfile(new MongoId(storageInfo.Holder));
+                box.HolderNickname = holderPmc?.Info?.Nickname;
+                if (holderPmc?.Inventory?.Items != null)
+                {
+                    (_, List<Item> descendants) = GuildStashBoxOps.GatherSubtree(holderPmc, storageInfo.OpenBoxItemId);
+                    flat = descendants;
+                    rootId = storageInfo.OpenBoxItemId;
+                }
+            }
+
+            int count = 0;
+            int units = 0;
+            box.Tree = BuildTree(flat, rootId, ref count, ref units);
+            box.TotalItems = count;
+            box.TotalUnits = units;
+            allBoxes.Add(box);
+        }
+
+        await WriteJson(context, StatusCodes.Status200OK, allBoxes);
+    }
+
+    // Nested tree from a flat item list, rooted at ParentId == rootId. Each node: tpl, localised name, optional Tag, stack count.
+    // Two totals: `total` = entries (things in here), `units` = summed stack sizes (a stack of 60 = 60). UI shows both.
     private List<StorageNodeDto> BuildTree(List<Item> items, string rootId, ref int total, ref int units)
     {
-        // Index children by parent id in one pass (no repeated scans over the flat list per node).
-        var byParent = new Dictionary<string, List<Item>>();
-        foreach (var item in items)
+        // index children by parent id for one lookup per node
+        Dictionary<string, List<Item>> parentLookup = new();
+        foreach (Item item in items)
         {
-            string pid = item.ParentId ?? "";
-            if (!byParent.TryGetValue(pid, out var siblings))
+            string currentItemPid = item.ParentId ?? "";
+            if (!parentLookup.TryGetValue(currentItemPid, out List<Item>? siblings))
             {
                 siblings = new List<Item>();
-                byParent[pid] = siblings;
+                parentLookup[currentItemPid] = siblings;
             }
             siblings.Add(item);
         }
-        return BuildChildren(byParent, rootId, ref total, ref units);
+        return BuildChildren(parentLookup, rootId, ref total, ref units);
     }
 
     private List<StorageNodeDto> BuildChildren(Dictionary<string, List<Item>> byParent, string parentId, ref int total, ref int units)
     {
-        var result = new List<StorageNodeDto>();
-        if (parentId == null || !byParent.TryGetValue(parentId, out var kids))
+        List<StorageNodeDto> subBox = new();
+        if (parentId == null || !byParent.TryGetValue(parentId, out List<Item>? children))
         {
-            return result;
+            return subBox;
         }
-        foreach (var item in kids)
+        foreach (Item child in children)
         {
             total++;
-            string tpl = item.Template.ToString();
-            var node = new StorageNodeDto
+            string tpl = child.Template.ToString();
+            StorageNodeDto node = new()
             {
                 Tpl = tpl,
                 Name = Leaves.Utils.Instance.getLocale("en", tpl, " Name") ?? tpl,
-                Count = (int)(item.Upd != null && item.Upd.StackObjectsCount != null ? item.Upd.StackObjectsCount.Value : 1),
+                Count = (int)(child.Upd != null && child.Upd.StackObjectsCount != null ? child.Upd.StackObjectsCount.Value : 1),
             };
-            if (item.Upd != null && item.Upd.Tag != null)
+            if (child.Upd != null && child.Upd.Tag != null)
             {
-                node.Tag = item.Upd.Tag.Name;
+                node.Tag = child.Upd.Tag.Name;
             }
             units += node.Count;
-            node.Children = BuildChildren(byParent, item.Id.ToString(), ref total, ref units);
-            result.Add(node);
+            node.Children = BuildChildren(byParent, child.Id.ToString(), ref total, ref units);
+            subBox.Add(node);
         }
-        return result;
-    }
-
-    // storageId (lowercase) -> the box's display name, derived by finding a guild box (in ANY loaded profile) tagged '@remote <id>' and reading its tpl.
-    // Only the FALLBACK for pre-BoxKey storages that don't record their own case type; a storage no box currently points at simply gets no type (null).
-    private Dictionary<string, string> MapStorageToBoxName()
-    {
-        var result = new Dictionary<string, string>();
-        var profiles = profileHelper.GetProfiles();
-        foreach (var pair in profiles)
-        {
-            var pmc = profileHelper.GetPmcProfile(pair.Key);
-            if (pmc?.Inventory?.Items == null)
-            {
-                continue;
-            }
-            foreach (var item in pmc.Inventory.Items)
-            {
-                if (!GuildStashContext.TplToBoxName.TryGetValue(item.Template, out var boxName))
-                {
-                    continue;
-                }
-                string? id = GuildStashValidation.ParseRemoteTag(item, out _);
-                if (id == null)
-                {
-                    continue;
-                }
-                if (!result.ContainsKey(id))
-                {
-                    result[id] = boxName;
-                }
-            }
-        }
-        return result;
+        return subBox;
     }
 
     // POST /guildstash/api/forceclose { id } -> { ok, changed, closed, kicked, message }.
-    //
-    // This used to just drop the bindings, which duplicated the contents whenever the orphaned open box was still sitting in someone's stash - and if that someone was ONLINE, their client carried on with a live open box the server had stopped tracking.
-    // So now it does the REAL thing:
-    //   1. For each binding on this storage, find the open box in its holder's profile and run the ordinary offline close (contents saved to storage, box swapped back to an empty closed case, binding dropped) - the exact path logout/startup use, backup zip included. No duplication.
-    //   2. Persist that profile, since there's no imminent client write to do it for us.
-    //   3. If the holder is still connected, flag a resync so their next item-event reloads their inventory (their client is otherwise holding a stale open box). Heavy, but force-close is a recovery tool, not a routine action.
-    // Anything left unresolvable (a binding whose box no longer exists at all) falls through to the old lock-drop, which is correct for a genuine orphan.
+    // Closes each holder's open box for real via CloseBoxById (contents saved, no dupe), reloads online holders' clients.
+    // A binding whose box is gone falls through to storage.ForceClose - a plain lock-drop, correct for a real orphan.
     private async Task HandleForceClose(HttpContext context)
     {
         string body = await Leaves.HttpUtils.ReadBody(context);
-        var request = JsonSerializer.Deserialize<ForceCloseRequest>(body, Json);
+        ForceCloseRequest? request = JsonSerializer.Deserialize<ForceCloseRequest>(body, Json);
         if (request == null || request.Id.Length == 0)
         {
             await WriteJson(context, StatusCodes.Status400BadRequest, new { ok = false, error = "id required" });
             return;
         }
 
-        // Ids fold to lowercase everywhere else (tag parse, filenames, bindings); match that here or a mixed-case id from a hand-made request silently matches nothing and reports success.
+        // lowercase, to match the binding keys
         string id = request.Id.ToLowerInvariant();
 
         int closed = 0;
         int kicked = 0;
-        var bindings = storage.GetBindingsSnapshot();
-        foreach (var pair in bindings)
+        Dictionary<string, OpenBinding> bindings = storage.GetBindingsSnapshot();
+        foreach (KeyValuePair<string, OpenBinding> pair in bindings)
         {
             if (pair.Value.StorageId != id)
             {
@@ -368,50 +337,30 @@ public class GuildStashApi(
             {
                 continue;
             }
-            var holderId = new MongoId(holder);
+            MongoId holderId = new(holder);
 
-            var pmc = profileHelper.GetPmcProfile(holderId);
+            PmcData? pmc = profileHelper.GetPmcProfile(holderId);
             if (pmc?.Inventory?.Items == null)
             {
                 continue;
             }
 
-            Item? openBox = null;
-            foreach (var item in pmc.Inventory.Items)
+            // NotFound here = genuine orphan
+            if (closer.CloseBoxById(pmc, pair.Key, holderId, $"Force-close of '{id}'") != CloseBoxResult.Closed)
             {
-                if (item.Id.ToString() == pair.Key)
-                {
-                    openBox = item;
-                    break;
-                }
-            }
-            if (openBox == null)
-            {
-                // Genuine orphan - the box is gone. The lock-drop below is the right answer.
-                continue;
-            }
-
-            string? error = closer.CloseInProfile(pmc, openBox, holderId, out _, out _);
-            if (error != null)
-            {
-                Leaves.Utils.Instance.printColor($"[GuildStash] Force-close of '{id}': could not close {holderId}'s open box: {error}", LogTextColor.Red);
                 continue;
             }
             closed++;
 
-            await saveServer.SaveProfileAsync(holderId);
-
             if (wsHandler.IsWebSocketConnected(holderId))
             {
-                // Flag a resync rather than pushing NotificationEventType.ForceLogout.
-                // ForceLogout works but drops the player to the DESKTOP; flagging makes their next item-event carry a Warning, which reloads their inventory in place (GuildStashResyncPatch).
                 GuildStashContext.FlagResync(holderId.ToString());
                 kicked++;
                 Leaves.Utils.Instance.printColor($"[GuildStash] Force-close of '{id}': {holderId} is online - closed their box and queued a client reload for their next action.", LogTextColor.Yellow);
             }
         }
 
-        // Mop up whatever's left: bindings with no reachable box, and the storage's vestigial holder field.
+        // mop up: bindings with no reachable box, and the storage's stale holder field
         bool changed = storage.ForceClose(id);
         changed = changed || closed > 0;
 
@@ -441,36 +390,4 @@ public class GuildStashApi(
     {
         await Leaves.HttpUtils.WriteJson(context, statusCode, payload, Json);
     }
-}
-
-// Wire shapes for the web UI storage feed.
-public sealed class StorageDto
-{
-    [JsonPropertyName("id")] public string Id { get; set; } = "";
-    [JsonPropertyName("open")] public bool Open { get; set; }
-    [JsonPropertyName("holderId")] public string? HolderId { get; set; }
-    [JsonPropertyName("holderNickname")] public string? HolderNickname { get; set; }
-    [JsonPropertyName("openedUtc")] public string? OpenedUtc { get; set; }
-    // The case type this stash is (e.g. "Item case" / "T H I C C item case"), or null if unknown.
-    [JsonPropertyName("boxType")] public string? BoxType { get; set; }
-    // The storage file exists but wouldn't parse - it is NOT really empty, it's corrupt. Open refuses it.
-    [JsonPropertyName("unreadable")] public bool Unreadable { get; set; }
-    // Count of every item ENTRY in the tree, each counted once (stack size ignored).
-    [JsonPropertyName("totalItems")] public int TotalItems { get; set; }
-    // Every entry's stack size SUMMED - a stack of 60 rounds counts 60, not 1.
-    [JsonPropertyName("totalUnits")] public int TotalUnits { get; set; }
-    // The full nested item tree (top-level entries; containers carry their own children).
-    [JsonPropertyName("tree")] public List<StorageNodeDto> Tree { get; set; } = new List<StorageNodeDto>();
-}
-
-// One node in a storage's item tree - an item, plus whatever nests inside it (grid contents, mods, etc.).
-public sealed class StorageNodeDto
-{
-    [JsonPropertyName("tpl")] public string Tpl { get; set; } = "";
-    [JsonPropertyName("name")] public string Name { get; set; } = "";
-    // The player's own inventory tag on this item (e.g. a case they named), if any.
-    [JsonPropertyName("tag")] public string? Tag { get; set; }
-    // Stack size (shown as "x N" when > 1). Still just ONE entry for the total-items count.
-    [JsonPropertyName("count")] public int Count { get; set; }
-    [JsonPropertyName("children")] public List<StorageNodeDto> Children { get; set; } = new List<StorageNodeDto>();
 }

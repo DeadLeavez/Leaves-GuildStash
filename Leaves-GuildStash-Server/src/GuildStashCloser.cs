@@ -3,95 +3,134 @@ using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Eft.Common;
 using SPTarkov.Server.Core.Models.Eft.Common.Tables;
 using SPTarkov.Server.Core.Models.Logging;
+using SPTarkov.Server.Core.Servers;
 
 namespace Leaves_GuildStash_Server;
 
-// The close mutation, factored out of the item-event router so it can run WITHOUT a live client too.
-// A "close" turns an OPEN guild box back into an empty CLOSED case: it saves the box's current contents to storage/<id>.jsonc, swaps the open box for a fresh empty closed case in the profile, and drops the open-binding.
-// It mutates the passed PmcData directly and reports the delta via `deleted`/`created`.
-//
-// The item-event path (GuildStashItemEventRouter) mirrors that delta into profileChanges so a live client applies it instantly.
-// The offline path (GuildStashSessionCleanup, on logout / login-reconcile) ignores the delta entirely - there's no live client to push to; the mutated profile is simply saved to disk and the player sees a closed box the next time their client reads it.
-[Injectable]
-public class GuildStashCloser(GuildStashStorage storage)
+// CloseBoxById outcome.
+public enum CloseBoxResult
 {
-    // Close an OPEN guild box in `pmc`: save its contents to storage, replace it with an empty CLOSED case.
-    // Returns null on success, or a player-facing error message (no valid close target, wrong item, etc.).
-    // Callers that echo to a live client use `deleted`/`created`; the offline callers discard them.
-    // `sessionId` is the box owner - used to snapshot their whole profile into the pre-close backup zip.
-    public string? CloseInProfile(PmcData pmc, Item box, MongoId sessionId, out List<string> deleted, out List<Item> created)
-    {
-        deleted = new List<string>();
-        created = new List<Item>();
+    Closed,
+    NotFound,    // id not in the profile: closed earlier this sweep, or a real orphan
+    Unresolved,  // CloseInProfile refused it; box left open
+    Threw,       // close threw mid-write; box left open
+}
 
-        if (!GuildStashContext.OpenToClosedTpl.TryGetValue(box.Template, out var closedTpl))
+[Injectable]
+public class GuildStashCloser(GuildStashStorage storage, SaveServer saveServer)
+{
+    // Returns null on success, or a player-facing error message.
+    // Saves the storage file, the backup, and the profile on success.
+    // deletedIds/createdIds: the item changes, only the event router reads it (to mirror the close to a live client).
+    public string? CloseInProfile(PmcData pmc, Item box, MongoId callerId, out List<string> deletedIds, out List<Item> createdIds)
+    {
+        deletedIds = new List<string>();
+        createdIds = new List<Item>();
+
+        if (!GuildStashContext.OpenToClosedTpl.TryGetValue(box.Template, out MongoId closedTpl))
         {
             return "Guild Stash: that isn't an open guild box.";
         }
 
-        // Resolve which storage to write to.
-        // The BINDING (recorded when this box was opened) wins over the current tag - editing the tag while open must NOT redirect the close to another file.
-        // The tag is only a fallback for when the binding is gone (e.g. server restarted since the box was opened).
-        string? tagId = GuildStashValidation.ParseRemoteTag(box, out _);
-        string? id;
-        if (storage.TryGetBinding(box.Id.ToString(), out var binding))
+        // the binding wins over the live tag. a retag on an open box must not redirect the close
+        string? taggedStorageId = GuildStashValidation.ParseRemoteTag(box, out _);
+        string? targetStorageId;
+        if (storage.TryGetBinding(box.Id.ToString(), out OpenBinding binding))
         {
-            string boundId = binding.StorageId;
-            id = boundId;
-            if (tagId != null && tagId != boundId)
+            string bindingStorageId = binding.StorageId;
+            targetStorageId = bindingStorageId;
+            if (taggedStorageId != null && taggedStorageId != bindingStorageId)
             {
-                Leaves.Utils.Instance.printColor($"[GuildStash] Close: tag was changed to '{tagId}' while open, but the box was opened as '{boundId}' - writing to '{boundId}'.", LogTextColor.Yellow);
+                Leaves.Utils.Instance.printColor($"[GuildStash] Close: tag was changed to '{taggedStorageId}' while open, but the box was opened as '{bindingStorageId}' - writing to '{bindingStorageId}'.", LogTextColor.Yellow);
             }
-            else if (tagId == null)
+            else if (taggedStorageId == null)
             {
-                Leaves.Utils.Instance.printColor($"[GuildStash] Close: tag was removed/invalidated while open - writing to the bound id '{boundId}'.", LogTextColor.Yellow);
+                Leaves.Utils.Instance.printColor($"[GuildStash] Close: tag was removed/invalidated while open - writing to the bound id '{bindingStorageId}'.", LogTextColor.Yellow);
             }
         }
         else
         {
-            // No binding (server restarted since open, or a force-close dropped it) - trust the tag, but only as far as an ALREADY-REGISTERED, not-currently-open storage.
-            // Without those two guards a retag while open could point this close at ANY id and overwrite another player's stash wholesale (or mint an unregistered one), with nothing but the backup zip as a trace.
-            id = tagId;
-            if (id == null)
+            // no binding (server restarted since open, or a force-close dropped it), so fall back to the tag,
+            // but only for an already-registered, currently-idle storage: without both guards a retag could aim this close at any id and fuck up another player's stash.
+            targetStorageId = taggedStorageId;
+            if (targetStorageId == null)
             {
-                return "Guild Stash: this box needs a valid '@remote <ID>' tag (letters and numbers only).";
+                return "Guild Stash: this box needs a valid '@r <ID>;' tag (letters and numbers only).";
             }
-            if (!storage.Exists(id))
+            if (!storage.Exists(targetStorageId))
             {
-                return $"Guild Stash: no storage '{id}' exists - retag this box with the ID it was opened as, then close it.";
+                return $"Guild Stash: no storage '{targetStorageId}' exists - retag this box with the ID it was opened as, then close it.";
             }
-            if (storage.IsOpenSomewhere(id, out _))
+            if (storage.IsOpenSomewhere(targetStorageId, out _))
             {
-                return $"Guild Stash: storage '{id}' is open in another box - retag this box with the ID it was opened as.";
+                return $"Guild Stash: storage '{targetStorageId}' is open in another box - retag this box with the ID it was opened as.";
             }
-            Leaves.Utils.Instance.printColor($"[GuildStash] Close: no open-binding for this box (restart?) - falling back to tag '{id}'.", LogTextColor.Yellow);
+            Leaves.Utils.Instance.printColor($"[GuildStash] Close: no open-binding for this box (restart?) - falling back to tag '{targetStorageId}'.", LogTextColor.Yellow);
         }
 
-        // Hard backup BEFORE any destructive write: zip the previous storage file + the holder's whole profile (which still has the open box full of items) so a mis-save can always be recovered.
-        storage.SnapshotBeforeClose(id, sessionId);
+        // recovery point: everything below mutates the storage file and the profile
+        storage.SnapshotBeforeClose(targetStorageId, callerId);
 
-        // Snapshot the current contents (live instances, values captured on serialize) BEFORE we delete them.
-        var (_, descendants) = GuildStashBoxOps.GatherSubtree(pmc, box.Id.ToString());
-        var stored = new StoredBox
+        // grab the contents before ReplaceBox drops them
+        (_, List<Item> descendants) = GuildStashBoxOps.GatherSubtree(pmc, box.Id.ToString());
+        StoredBox stored = new()
         {
-            Id = id,
+            Id = targetStorageId,
             RootId = box.Id.ToString(),
             Contents = descendants,
             Holder = null,
-            // (Re-)stamp the case type on every close, which is also what backfills the pre-BoxKey storages that Open currently grandfathers in.
+            // re-stamped every close, which also backfills the pre-BoxKey stashes that Open grandfathers in
             BoxKey = GuildStashContext.BoxKeyForTpl(box.Template),
         };
         storage.Save(stored);
 
-        // Spawn a fresh EMPTY closed case in its place.
-        var (del, cre) = GuildStashBoxOps.ReplaceBox(pmc, box, closedTpl, new MongoId(), box.Id.ToString(), new List<Item>());
-        deleted = del;
-        created = cre;
+        (deletedIds, createdIds) = GuildStashBoxOps.ReplaceBox(pmc, box, closedTpl, new MongoId(), box.Id.ToString(), new List<Item>());
 
-        // Storage written and the open box is gone - drop its binding.
         storage.UnbindOpenBox(box.Id.ToString());
 
-        Leaves.Utils.Instance.printColor($"[GuildStash] Closed storage '{id}' ({descendants.Count} item(s) saved).", LogTextColor.Green);
+        // storage file is already on disk; land the matching profile change too, or a crash here reopens the box with the items gone
+        saveServer.SaveProfileAsync(callerId).GetAwaiter().GetResult();
+
+        Leaves.Utils.Instance.printColor($"[GuildStash] Closed storage '{targetStorageId}' ({descendants.Count} item(s) saved).", LogTextColor.Green);
         return null;
+    }
+
+    // Saves the storage and profile on success (via CloseInProfile)
+    public CloseBoxResult CloseBoxById(PmcData pmc, string boxId, MongoId callerId, string logCloserLabel)
+    {
+        if (pmc.Inventory?.Items == null)
+        {
+            return CloseBoxResult.NotFound;
+        }
+
+        Item? box = null;
+        foreach (Item item in pmc.Inventory.Items)
+        {
+            if (item.Id.ToString() == boxId)
+            {
+                box = item;
+                break;
+            }
+        }
+        if (box == null)
+        {
+            return CloseBoxResult.NotFound;
+        }
+
+        try
+        {
+            string? error = CloseInProfile(pmc, box, callerId, out _, out _);
+            if (error != null)
+            {
+                Leaves.Utils.Instance.printColor($"[GuildStash] {logCloserLabel}: could not close box {boxId} for {callerId}: {error}", LogTextColor.Red);
+                return CloseBoxResult.Unresolved;
+            }
+            return CloseBoxResult.Closed;
+        }
+        catch (Exception ex)
+        {
+            Leaves.Utils.Instance.printColor($"[GuildStash] {logCloserLabel}: close of box {boxId} for {callerId} THREW: {ex.Message} - leaving it open, continuing with the rest.", LogTextColor.Red);
+            return CloseBoxResult.Threw;
+        }
     }
 }

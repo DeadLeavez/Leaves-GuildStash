@@ -11,13 +11,11 @@ using SPTarkov.Server.Core.Utils;
 namespace Leaves_GuildStash_Server;
 
 // Auto-closes guild boxes a player left open, by hooking the game-session lifecycle.
-// GameStaticRouter injects GameCallbacks by its concrete type, so a TypeOverride subclass slots straight into the /client/game/* routes with no Harmony.
-// We override only two endpoints and defer the rest to base:
-//
-//   - GameLogout (/client/game/logout): clean exit. Close the session's open boxes THEN call base - base saves the profile first, so the closed box is what gets persisted.
-//   - GameStart (/client/game/start): login. Backstop for the one case a logout can't catch - a box left open when the SERVER restarted. A normal login with nothing open is a cheap no-op scan.
-//
-// A non-clean exit (crash / taskkill) fires neither; GuildStashWebSocketClosePatch covers that via the websocket disconnect, reusing the same GuildStashSessionCleanup.
+// GameCallbacks is injected by concrete type, so a TypeOverride subclass slots into /client/game/* with no Harmony.
+// Overrides two endpoints, defers the rest to base:
+//   GameLogout: clean exit. Close boxes THEN call base, so the persisted profile has the closed box.
+//   GameStart: login. Backstop for a box left open across a SERVER restart (logout can't catch that). No-op when nothing's open.
+// A crash / taskkill fires neither - GuildStashWebSocketClosePatch covers that via the websocket drop.
 [Injectable(TypeOverride = typeof(GameCallbacks))]
 public class GuildStashGameCallbacks(
     HttpResponseUtil httpResponseUtil,
@@ -30,25 +28,23 @@ public class GuildStashGameCallbacks(
     GuildStashSessionCleanup cleanup)
     : GameCallbacks(httpResponseUtil, watermark, saveServer, backupService, gameController, profileActivityService, timeUtil)
 {
-    // Clean logout: close open boxes BEFORE base saves the profile, so the persisted state is closed.
     public override async ValueTask<string> GameLogout(string url, EmptyRequestData info, MongoId sessionID)
     {
-        try
+        try // our cleanup must never break logout
         {
             cleanup.CloseAllForSession(sessionID, "logout");
         }
         catch (Exception ex)
         {
-            // Never let our cleanup break the player's logout - log and fall through to the real logout.
             Leaves.Utils.Instance.printColor($"[GuildStash] logout cleanup failed for {sessionID}: {ex.Message}", LogTextColor.Red);
         }
         return await base.GameLogout(url, info, sessionID);
     }
 
-    // Login: reconcile any box left open across a server restart, before the client reads its inventory.
+    // reconcile a box left open across a server restart
     public override async ValueTask<string> GameStart(string url, EmptyRequestData info, MongoId sessionID)
     {
-        var result = await base.GameStart(url, info, sessionID);
+        string result = await base.GameStart(url, info, sessionID);
         try
         {
             cleanup.CloseAllForSession(sessionID, "login-reconcile");

@@ -16,10 +16,11 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <OutputType>Library</OutputType>
     <Version>0.1.0</Version>
-    <!-- Client plugin, NOT a server mod. dist\SPT mirrors the SERVER root (â€¦\SPT-4.0.13\SPT), so a
-         BepInEx path under it would be the wrong install. Build into a separate client dist tree, and
-         (below) auto-deploy to the actual EFT client's BepInEx\plugins (â€¦\SPT-4.0.13\BepInEx\plugins). -->
-    <OutputPath>..\..\dist\CLIENT\BepInEx\plugins\$(MSBuildProjectName)\</OutputPath>
+    <!-- Client plugin, NOT a server mod. The dist\ tree mirrors the GAME ROOT (â€¦\SPT-4.0.13\), with
+         dist\SPT (server mods) and dist\BepInEx (client plugins) as siblings - exactly the layout the
+         combined release zip is staged from. This plugin builds into dist\BepInEx\plugins\<Name> and
+         (below) auto-deploys to the actual EFT client's BepInEx\plugins (â€¦\SPT-4.0.13\BepInEx\plugins). -->
+    <OutputPath>..\..\dist\BepInEx\plugins\$(MSBuildProjectName)\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <!-- We reference game/BepInEx DLLs but must never copy them into the plugin output. -->
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
@@ -86,6 +87,11 @@
     </Reference>
 
     <!-- The game itself: Item (EFT.InventoryLogic), ItemUiContext / EItemViewType (EFT.UI), etc. -->
+    <!-- IItemComponent lives here; needed to call Item.GetItemComponent<TagComponent>() -->
+    <Reference Include="ItemComponent.Types">
+      <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\ItemComponent.Types.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Assembly-CSharp">
       <HintPath>G:\Tarkov\SPT-AKI\SPT-4.0.13\EscapeFromTarkov_Data\Managed\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
@@ -106,6 +112,6 @@
 
   <!-- No release-zip packaging here on purpose: Guild Stash ships as a SINGLE combined download
        (this client + the server) built by the Leaves-GuildStash-Server project, which pulls this
-       plugin's build output straight from ..\dist\CLIENT and lays it into the same zip under
+       plugin's build output straight from ..\dist\BepInEx and lays it into the same zip under
        BepInEx\plugins. This project only builds itself and (above) deploys live to the client. -->
 </Project>

@@ -51,6 +51,11 @@
     <None Include="assets\**">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- Third-party licence for the vendored MultiSelectInterop.cs (UI Fixes, MIT). Ships in the
+         combined zip alongside the mod so the MIT notice travels with the binary. -->
+    <None Include="licenses\**">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
   <!-- Guild Stash ships as TWO projects - this net9 server AND the net472 client plugin - but as ONE
@@ -60,10 +65,10 @@
            SPT\user\mods\Leaves-GuildStash-Server\    (this server mod)
            BepInEx\plugins\Leaves-GuildStash-Client\  (the client plugin)
        The client is guaranteed built first by the build-order ProjectReference above, so its output
-       already exists in ..\dist\CLIENT by the time we get here. -->
+       already exists in ..\dist\BepInEx by the time we get here. -->
   <Target Name="CopyToSecondaryLocation" AfterTargets="Build">
     <PropertyGroup>
-      <ClientOutDir>$(MSBuildProjectDirectory)\..\..\dist\CLIENT\BepInEx\plugins\Leaves-GuildStash-Client</ClientOutDir>
+      <ClientOutDir>$(MSBuildProjectDirectory)\..\..\dist\BepInEx\plugins\Leaves-GuildStash-Client</ClientOutDir>
     </PropertyGroup>
     <ItemGroup>
       <ServerOutputFiles Include="$(OutputPath)**\*.*" />

@@ -5,6 +5,7 @@ using SPTarkov.Server.Core.Controllers;
 using SPTarkov.Server.Core.DI;
 using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Eft.Common;
+using SPTarkov.Server.Core.Models.Eft.Common.Tables;
 using SPTarkov.Server.Core.Models.Eft.Inventory;
 using SPTarkov.Server.Core.Models.Eft.ItemEvent;
 using SPTarkov.Server.Core.Models.Enums;
@@ -15,17 +16,14 @@ namespace Leaves_GuildStash_Server;
 
 // Refuse to discard an OPEN guild box, server-side.
 //
-// Discarding one destroys everyone's items and strands the storage lock (nothing left in any profile for a close to work from - it takes the startup orphan sweep to recover, and only back to the last-closed contents).
-// The item template flags don't stop it: `IsUnsaleable`/`IsUndiscardable` are set on the open box and the client discarded it anyway, and NOTHING in the SPT server reads either one.
-// So the block has to live where the deletion actually happens.
+// Discarding one destroys everyone's items and strands the lock (recovery is the startup sweep, back to last-closed only).
+// The item-template flags don't stop it - IsUnsaleable/IsUndiscardable are set and the client discards anyway, and SPT reads neither - so the block lives where the deletion happens.
+// Harmony because InventoryController.DiscardItem isn't virtual (nor is InventoryCallbacks.RemoveItem one level up).
 //
-// Harmony, because `InventoryController.DiscardItem` isn't virtual (no DI TypeOverride) - and `InventoryCallbacks.RemoveItem`, one level up, isn't either.
+// Return false skips the original; the appended Warning gives the player a reason AND resyncs the client, which has already drawn the item as gone.
 //
-// Returning false SKIPS the original, so the item is never removed, and we append a Warning so the client shows a reason and resyncs.
-// The resync matters: without it the client would have already drawn the item as gone and would sit desynced from a profile that still has it.
-//
-// CLOSED boxes are deliberately still discardable - they're empty by construction and cost a GP coin to replace, so a player must be able to bin one they no longer want.
-// The stash itself is untouched by discarding its box; the contents live in storage/<id>.jsonc.
+// CLOSED boxes stay discardable on purpose - empty, a GP coin to replace. The stash is untouched either way; contents live in storage/<id>.jsonc.
+// This is in *theory* impossible to ever happen.
 public class GuildStashDiscardPatch : AbstractPatch
 {
     protected override MethodBase GetTargetMethod()
@@ -36,21 +34,20 @@ public class GuildStashDiscardPatch : AbstractPatch
     [PatchPrefix]
     public static bool Prefix(PmcData pmcData, InventoryRemoveRequestData request, MongoId sessionId, ItemEventRouterResponse output)
     {
-        // Anything unexpected must let the ORIGINAL run (return true).
-        // This sits on the generic discard path used by every item in the game, so a fault here must never stop a player binning a bandage.
+        // on fault, let the ORIGINAL run (return true): this is the discard path for every item in the game - a bug here must never stop someones discarding
         try
         {
             if (GuildStashContext.Config == null || !GuildStashContext.Config.Enabled)
             {
                 return true;
             }
-            if (request == null || request.Item == null || pmcData?.Inventory?.Items == null)
+            if (request == null || request.Item.IsEmpty || pmcData?.Inventory?.Items == null)
             {
                 return true;
             }
 
             string targetId = request.Item.ToString();
-            foreach (var item in pmcData.Inventory.Items)
+            foreach (Item item in pmcData.Inventory.Items)
             {
                 if (item.Id.ToString() != targetId)
                 {
@@ -65,14 +62,13 @@ public class GuildStashDiscardPatch : AbstractPatch
                 Leaves.Utils.Instance.printColor($"[GuildStash] Refused a discard of OPEN guild box {targetId} by {sessionId}.", LogTextColor.Yellow);
 
 #pragma warning disable CS0618
-                using (var scope = ServiceLocator.ServiceProvider.CreateScope())
+                using (IServiceScope scope = ServiceLocator.ServiceProvider.CreateScope())
 #pragma warning restore CS0618
                 {
-                    var httpResponseUtil = scope.ServiceProvider.GetService<HttpResponseUtil>();
+                    HttpResponseUtil? httpResponseUtil = scope.ServiceProvider.GetService<HttpResponseUtil>();
                     if (httpResponseUtil == null)
                     {
-                        // No way to tell the player why.
-                        // Letting the discard proceed would destroy shared items, so refuse silently instead - the client resyncs on its own soon enough and the box reappears.
+                        // can't tell the player why, but proceeding would destroy shared items - refuse silently, the client resyncs soon enough
                         return false;
                     }
                     httpResponseUtil.AppendErrorToOutput(

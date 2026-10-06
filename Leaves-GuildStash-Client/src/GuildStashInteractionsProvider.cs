@@ -1,32 +1,32 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using System.Threading.Tasks;
 using EFT.Communications;
 using EFT.InventoryLogic;
 using EFT.UI;
 using IcyClawz.CustomInteractions;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using SPT.Common.Http;
 using SPT.Reflection.Utils;
+using UIFixesInterop;
 
 namespace Leaves_GuildStash_Client
 {
-    // Adds the guild-stash context-menu entries.
-    // IcyClawz calls GetCustomInteractions every time an item's right-click menu is built; we look at the item's TEMPLATE against the registry the server handed us (GET /guildstash/boxtpls, fetched once on load) and return the one entry that fits:
-    //   closed guild box -> "Open Remote"    open guild box -> "Close Remote"
-    //   plain Item/THICC case -> "Convert to Remote"
-    // So a closed box only ever offers Open, an open box only Close. The server re-validates every action (tag, tpl) regardless of the menu.
+    // Adds the guild-stash context-menu entries. IcyClawz calls GetCustomInteractions every time a right-click menu is built.
+    // We match the item's tpl against the registry the server handed us (GET /guildstash/boxtpls, fetched once on load):
+    //   closed box  -> "Open Remote"
+    //   open box    -> "Close Remote"
+    //   base case   -> "Convert to Remote" (thicc + regular item cases by default)
     internal sealed class GuildStashInteractionsProvider : ICustomInteractionsProvider
     {
-        // Template-id sets from the server. Populated by FetchRegistry (background, once). Read-only after.
+        // Template-id sets from the server.
         private static readonly HashSet<string> ClosedTpls = new HashSet<string>();
         private static readonly HashSet<string> OpenTpls = new HashSet<string>();
         private static readonly HashSet<string> BaseTpls = new HashSet<string>();
-        private static bool _registryLoaded;
+        private static volatile bool _registryLoaded;
 
-        // Kick off the one-time registry fetch. Called from Plugin.Awake; runs off-thread (we only touch the thread-safe sets, never a Unity object).
-        // Menus built before it finishes simply show no guild entries until it lands (a second or two after the server is reachable).
+        // one-time registry fetch
         internal static void LoadRegistry()
         {
             Task.Run(() =>
@@ -39,11 +39,10 @@ namespace Leaves_GuildStash_Client
                     FillSet(root, "open", OpenTpls);
                     FillSet(root, "baseTpls", BaseTpls);
                     _registryLoaded = true;
-                    Plugin.Dbg($"Registry loaded: {ClosedTpls.Count} closed, {OpenTpls.Count} open, {BaseTpls.Count} base tpls.");
                 }
                 catch (Exception ex)
                 {
-                    Plugin.Dbg("Registry fetch FAILED: " + ex.Message);
+                    Plugin.Log.LogError("[GuildStash] Registry fetch failed: " + ex.Message);
                 }
             });
         }
@@ -65,21 +64,33 @@ namespace Leaves_GuildStash_Client
             }
         }
 
-        // True when the item sits directly in the stash's main grid (container id "hideout"), i.e. the stash root.
-        // Item/ItemAddress/IContainer are plain EFT classes (not Unity objects), so ordinary null checks are safe here. Mirrors the server's stash-root check for Open.
+        // The tag text this client currently sees on the item, or null if it has none.
+        //
+        // Sent to /guildstash/precheck for Convert ONLY. The server's profile copy can lag this by one
+        // queued item-event op, which makes an untagged case and a just-tagged one indistinguishable from
+        // its side. We do NOT parse it here - the server runs its own ParseRemoteTag on the string, so
+        // there's exactly one set of tag rules. The real Convert op sends no tag at all.
+        private static string CurrentTagName(Item item)
+        {
+            TagComponent tag = item.GetItemComponent<TagComponent>();
+            if (tag == null)
+            {
+                return null;
+            }
+            return tag.Name;
+        }
+
         private static bool IsInStashRoot(Item item)
         {
-            ItemAddress address = item.CurrentAddress;
-            if (address == null)
+            if (item.CurrentAddress == null)
             {
                 return false;
             }
-            EFT.InventoryLogic.IContainer container = address.Container;
-            if (container == null)
+            if (item.CurrentAddress.Container == null)
             {
                 return false;
             }
-            return container.ID == "hideout";
+            return item.CurrentAddress.Container.ID == "hideout";
         }
 
         public IEnumerable<CustomInteraction> GetCustomInteractions(ItemUiContext context, EItemViewType viewType, Item item)
@@ -94,48 +105,147 @@ namespace Leaves_GuildStash_Client
             string tpl = item.StringTemplateId;
             string itemId = item.Id;
 
+            // When UI Fixes multi-select holds more than one item AND this box is part of that selection,
+            // swap the single-box entry for a batch entry that fans the same action over every matching
+            // box in the selection. Right-clicking a non-selected item clears the selection client-side,
+            // so in practice this only ever fires for a member; SelectionContains is belt-and-suspenders.
+            bool multi = MultiSelect.Count > 1 && SelectionContains(item);
+
             if (ClosedTpls.Contains(tpl))
             {
-                // Only openable from the stash root (matches the server check). Grey the entry out elsewhere and say why, rather than letting the click fail with a warning.
-                interactions.Add(new CustomInteraction(context)
+                if (multi)
                 {
-                    Caption = () => "Open Remote",
-                    Enabled = () => IsInStashRoot(item),
-                    Error = () => "Move the box into your stash to open it.",
-                    Action = () => TryAction("GuildStashOpen", itemId),
-                });
+                    int count = CountSelectionMatching(ClosedTpls);
+                    interactions.Add(new CustomInteraction(context)
+                    {
+                        Caption = () => "Open Remote (" + count + ")",
+                        Enabled = () => AllSelectionMatchingInStashRoot(ClosedTpls),
+                        Error = () => "Move every selected box into your stash to open them.",
+                        Action = () => BatchAction("GuildStashOpen", ClosedTpls),
+                    });
+                }
+                else
+                {
+                    interactions.Add(new CustomInteraction(context)
+                    {
+                        Caption = () => "Open Remote",
+                        Enabled = () => IsInStashRoot(item),
+                        Error = () => "Move the box into your stash to open it.", // shown as the greyed-out reason when Enabled is false
+                        Action = () => TryAction("GuildStashOpen", itemId),
+                    });
+                }
             }
             else if (OpenTpls.Contains(tpl))
             {
-                interactions.Add(new CustomInteraction(context)
+                if (multi)
                 {
-                    Caption = () => "Close Remote",
-                    Enabled = () => true,
-                    Action = () => TryAction("GuildStashClose", itemId),
-                });
+                    int count = CountSelectionMatching(OpenTpls);
+                    interactions.Add(new CustomInteraction(context)
+                    {
+                        Caption = () => "Close Remote (" + count + ")",
+                        Enabled = () => true,
+                        Action = () => BatchAction("GuildStashClose", OpenTpls),
+                    });
+                }
+                else
+                {
+                    interactions.Add(new CustomInteraction(context)
+                    {
+                        Caption = () => "Close Remote",
+                        Enabled = () => true,
+                        Action = () => TryAction("GuildStashClose", itemId),
+                    });
+                }
             }
             else if (BaseTpls.Contains(tpl))
             {
-                // Convert respawns the case where it stands, and delivering a FILLED case into a nested container wedges the op-queue - so, like Open, it's stash-root only.
-                // Grey it out elsewhere with the reason rather than letting the click fail.
+                // grey out with a reason rather than let the click fail.
+                // Tag state isn't checked here - it's read at click time and sent with the precheck, so a
+                // case tagged a moment ago still converts on the first try.
                 interactions.Add(new CustomInteraction(context)
                 {
                     Caption = () => "Convert to Remote",
                     Enabled = () => IsInStashRoot(item),
                     Error = () => "Move the case into your stash to convert it.",
-                    Action = () => TryAction("GuildStashConvert", itemId),
+                    Action = () => TryAction("GuildStashConvert", itemId, CurrentTagName(item)),
                 });
             }
 
             return interactions;
         }
 
-        // Menu-click entry point. Preflight the server's validation first: on a soft "you can't do that", show a lightweight in-game notification (no client reset) and stop.
-        // Only a passing check escalates to the real item-event.
-        // Runs on the Unity main thread (the click is) - the preflight is one quick localhost POST, and NotificationManagerClass must be called from the main thread anyway.
-        private static void TryAction(string action, string itemId)
+        // --- UI Fixes multi-select helpers -------------------------------------------------------
+        // All of these no-op safely when UI Fixes is absent: MultiSelect.Count is 0 and
+        // MultiSelect.Items is empty, so the callers never reach a batch path.
+
+        // Is this exact item one of the currently multi-selected items?
+        private static bool SelectionContains(Item item)
         {
-            string reason = Precheck(action, itemId);
+            foreach (Item selected in MultiSelect.Items)
+            {
+                if (ReferenceEquals(selected, item))
+                {
+                    return true;
+                }
+                if (selected != null && selected.Id == item.Id)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // How many selected items are boxes this action applies to (a mixed selection is fine - the
+        // others are skipped). This drives the "(N)" count in the caption.
+        private static int CountSelectionMatching(HashSet<string> tpls)
+        {
+            int count = 0;
+            foreach (Item selected in MultiSelect.Items)
+            {
+                if (selected != null && tpls.Contains(selected.StringTemplateId))
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        // Every selected box of a matching type must be in the stash root for the batch Open to enable.
+        private static bool AllSelectionMatchingInStashRoot(HashSet<string> tpls)
+        {
+            foreach (Item selected in MultiSelect.Items)
+            {
+                if (selected == null || !tpls.Contains(selected.StringTemplateId))
+                {
+                    continue;
+                }
+                if (!IsInStashRoot(selected))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Fan a single-box action out over every selected box whose tpl is in `tpls`. UI Fixes' Apply
+        // walks the selection in grid order, one item per frame; each box still goes through the exact
+        // same precheck + op path as the single-box action, so a bad box just gets skipped with its own
+        // notification and the rest carry on.
+        private static void BatchAction(string action, HashSet<string> tpls)
+        {
+            MultiSelect.Apply(selected =>
+            {
+                if (selected == null || !tpls.Contains(selected.StringTemplateId))
+                {
+                    return;
+                }
+                TryAction(action, selected.Id);
+            });
+        }
+
+        private static void TryAction(string action, string itemId, string currentTag = null)
+        {
+            string reason = Precheck(action, itemId, currentTag);
             if (reason != null)
             {
                 NotificationManagerClass.DisplayWarningNotification(reason, ENotificationDurationType.Default);
@@ -145,80 +255,71 @@ namespace Leaves_GuildStash_Client
         }
 
         // Ask the server whether this action is allowed, without doing it.
-        // Returns null when allowed (or when the check itself couldn't run - fail open, since the item-event's own Warning is the real backstop), otherwise the player-facing reason to show.
-        private static string Precheck(string action, string itemId)
+        private static string Precheck(string action, string itemId, string currentTag)
         {
             try
             {
-                string body = "{\"action\":\"" + action + "\",\"itemId\":\"" + itemId + "\"}";
+                JObject payload = new JObject
+                {
+                    ["action"] = action,
+                    ["itemId"] = itemId
+                };
+
+                // Convert passes its live tag so the server can judge it despite the queued-op lag.
+                // Omitted entirely when there's no tag, so the server falls back to its own copy.
+                if (currentTag != null)
+                {
+                    payload["tag"] = currentTag;
+                }
+
+                string body = payload.ToString(Formatting.None);
+
                 string response = RequestHandler.PostJson("/guildstash/precheck", body);
                 JObject root = JObject.Parse(response);
 
-                JToken okToken = root["ok"];
-                bool ok = okToken != null && okToken.Value<bool>();
-                if (ok)
+                if (root.Value<bool>("ok"))
                 {
                     return null;
                 }
 
-                JToken messageToken = root["message"];
-                if (messageToken != null && messageToken.Type != JTokenType.Null)
+                string message = root.Value<string>("message");
+                if (message != null)
                 {
-                    return messageToken.ToString();
+                    return message;
                 }
                 return "Guild Stash: that action isn't allowed right now.";
             }
             catch (Exception ex)
             {
-                Plugin.Dbg("Precheck failed (allowing action through): " + ex.Message);
+                Plugin.Log.LogWarning("[GuildStash] Precheck failed (allowing action through): " + ex.Message);
                 return null;
             }
         }
 
-        // Enqueue our custom item-event through the game's OWN operation queue.
-        // The queue serializes the plain object into { data: [ <op> ], ... }, POSTs to items/moving, and applies the response's profileChanges automatically - so the box swaps live, no relaunch.
-        //
-        // MUST run on the Unity main thread (the context-menu click already is).
-        // The callback is NOT optional: the queue Invokes it with no null check, so a null one NREs and jams the queue.
+        // send the custom item-event through the game's own op-queue - it serializes to { data: [<op>] }, POSTs items/moving, applies profileChanges
         private static void SendAction(string action, string itemId)
         {
-            Plugin.Capture = true; // open the first-chance exception capture window for this action
-            Plugin.Dbg($"Sending {action} for item {itemId} through the operation queue...");
             try
             {
-                object session = PatchConstants.BackEndSession;
+                ISession session = PatchConstants.BackEndSession;
                 if (session == null)
                 {
-                    Plugin.Dbg("ERROR: No BackEndSession (need to be at the menu with a profile loaded).");
+                    Plugin.Log.LogError("[GuildStash] No BackEndSession (need to be at the menu with a profile loaded).");
                     return;
                 }
-
-                MethodInfo send = session.GetType().GetMethod("SendOperationRightNow", BindingFlags.Public | BindingFlags.Instance);
-                if (send == null)
-                {
-                    Plugin.Dbg("ERROR: SendOperationRightNow not found on " + session.GetType().FullName);
-                    return;
-                }
-
-                Type callbackType = send.GetParameters()[1].ParameterType;
-                MethodInfo handler = typeof(GuildStashInteractionsProvider).GetMethod(nameof(OnActionResult), BindingFlags.NonPublic | BindingFlags.Static);
-                Delegate callback = Delegate.CreateDelegate(callbackType, handler);
 
                 object operation = new { Action = action, ItemId = itemId };
-                send.Invoke(session, new object[] { operation, callback });
-                Plugin.Dbg($"{action} enqueued. Awaiting apply/result...");
+                session.SendOperationRightNow(operation, OnActionResult);
             }
             catch (Exception ex)
             {
-                Plugin.Dbg($"{action} FAILED: " + ex);
+                Plugin.Log.LogError($"[GuildStash] {action} failed: " + ex);
             }
         }
 
-        // Operation-completion callback.
-        // Object param (not the game's IResult) so we don't hard-reference an obfuscated type; Delegate.CreateDelegate binds it to the real Callback delegate by contravariance.
+        // completion callback - the queue Invokes it with no null check, so it must exist even though it does nothing
         private static void OnActionResult(object result)
         {
-            Plugin.Dbg("Guild-stash operation callback FIRED. Result: " + result);
         }
     }
 }
